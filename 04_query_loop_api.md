@@ -10,6 +10,9 @@
 4. 理解错误恢复的分层设计（escalate → multi-turn → reactive compact）
 5. 理解 prompt cache 优化的全链路设计
 6. 理解 token budget 的 diminishing returns 检测
+7. **新增** 通过端到端请求追踪建立整体认知
+8. **新增** 理解设计决策背后的方案对比（为什么不用其他方案）
+9. **新增** 提炼可迁移到自己 Agent 系统中的设计模式
 
 ---
 
@@ -163,6 +166,142 @@ const next: State = {
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### 4.1.4 端到端请求追踪：跟着一个请求走完全程
+
+理解 query loop 最好的方式不是分模块看，而是**跟着一个真实请求走完全程**。
+
+假设用户输入：`帮我修复 src/auth.ts 中的空指针 bug`
+
+```
+时间线                    发生了什么                                    数据变化
+─────────────────────────────────────────────────────────────────────────────────────
+T+0ms    用户按回车
+         │
+         ├── processUserInput()                                messages = [
+         │   将用户输入包装为 Message                              { role: 'user',
+         │   type: 'user', content: [{ type: 'text',               content: '帮我修复...' }
+         │   text: '帮我修复 src/auth.ts 中的空指针 bug' }]       ]
+         │
+         ├── query() 入口
+         │   ├── buildQueryConfig() → 快照不可变配置
+         │   ├── startRelevantMemoryPrefetch() → 后台预取记忆
+         │   └── 初始化 State 对象 (turnCount=0)
+         │
+         ▼ ═══ 进入 while(true) 循环 ═══
+
+T+1ms    Phase 0: 预处理管线
+         │
+         ├── applyToolResultBudget()  → 无操作（第一轮没有工具结果）
+         ├── snipCompact()            → 无操作（消息太少）
+         ├── microcompact()           → 无操作
+         ├── contextCollapse()        → 无操作
+         └── autocompact()            → 无操作
+
+T+2ms    Phase 1: 组装 API 请求
+         │
+         ├── prependUserContext()                                API payload = {
+         │   注入 CLAUDE.md 内容到 system prompt                   system: [系统提示 + CLAUDE.md],
+         │   注入 git status 等上下文                               tools: [Bash, Read, Edit, ...],
+         │                                                         messages: [用户消息],
+         ├── callModel()                                           model: 'claude-sonnet-4-...',
+         │   发送 HTTP POST 到 Anthropic API                       max_tokens: 8192
+         │   开始接收 SSE 流                                     }
+         │
+         ▼
+
+T+500ms  Phase 1: 流式接收（持续 3-8 秒）
+         │
+         │  ┌─ SSE chunk 1: thinking block (如果启用 extended thinking)
+         │  ├─ SSE chunk 2: text "让我先看看这个文件..."
+         │  ├─ SSE chunk 3: tool_use 开始 { name: 'Read', id: 'tu_001' }
+         │  │   └── StreamingToolExecutor.addTool('Read', 'tu_001')
+         │  │       canExecuteTool(true) → 立即开始执行！
+         │  │       Read('src/auth.ts') 在后台运行
+         │  │
+         │  ├─ SSE chunk 4: tool_use input 完成 { path: 'src/auth.ts' }
+         │  ├─ SSE chunk 5: tool_use 开始 { name: 'Grep', id: 'tu_002' }
+         │  │   └── StreamingToolExecutor.addTool('Grep', 'tu_002')
+         │  │       canExecuteTool(true) → Read 是 ConcurrencySafe，并行！
+         │  │       Grep('null.*pointer', 'src/') 在后台运行
+         │  │
+         │  └─ SSE chunk N: message_stop, stop_reason: 'tool_use'
+         │
+         ▼
+
+T+4000ms Phase 2: 收集工具结果
+         │
+         ├── getRemainingResults()                               messages = [
+         │   Read 已完成 → yield tool_result                       用户消息,
+         │   Grep 已完成 → yield tool_result                       assistant(text + 2个tool_use),
+         │                                                         user(2个tool_result)
+         ├── 消费 memoryPrefetch（如果已完成）                   ]
+         ├── 消费 skillDiscovery（如果有）
+         └── needsFollowUp = true（有 tool_use）
+
+         Phase 4: 继续
+         state = { messages: [..., tool_results], turnCount: 1,
+                   transition: { reason: 'next_turn' } }
+         continue → 回到 Phase 0
+
+         ▼ ═══ 第二次迭代 ═══
+
+T+4001ms Phase 0: 预处理管线
+         ├── snipCompact() → 可能裁剪第一轮的 Read 结果（如果文件很大）
+         └── 其他 → 无操作
+
+T+4002ms Phase 1: 第二次 API 调用
+         │                                                       API payload = {
+         │  messages 现在包含完整的对话历史                         messages: [
+         │  前缀与上次相同 → prompt cache 命中！                      用户消息,        ← 缓存命中
+         │  只需要为新增的 tool_result 付费                           assistant(...),   ← 缓存命中
+         │                                                           user(tool_results) ← 新增
+         │  Claude 看到文件内容，生成修复方案                       ]
+         │  返回 tool_use: Edit('src/auth.ts', ...)               }
+         │
+         ▼
+
+T+8000ms Phase 2: 执行 Edit
+         │
+         ├── Edit 不是 ConcurrencySafe → 独占执行
+         ├── 权限检查 → 弹出确认对话框（如果需要）
+         ├── 用户确认 → 执行编辑
+         └── tool_result: { success: true }
+
+         Phase 4: 继续 → 第三次迭代
+
+         ▼ ═══ 第三次迭代 ═══
+
+T+9000ms Phase 1: 第三次 API 调用
+         │
+         │  Claude 看到 Edit 成功
+         │  返回 text: "已修复空指针 bug，添加了 null check..."
+         │  stop_reason: 'end_turn'（没有 tool_use）
+         │
+         ▼
+
+T+12000ms Phase 3: 停止判断
+          │
+          ├── 没有 413 错误 → 跳过
+          ├── stop_reason != max_output_tokens → 跳过
+          ├── handleStopHooks()
+          │   ├── 执行用户定义的 stop hooks（如 lint 检查）
+          │   ├── hooks 通过 → 继续停止流程
+          │   └── 后台: extractMemories(), promptSuggestion()
+          ├── checkTokenBudget() → budget 为 null → stop
+          └── return { reason: 'completed' }
+
+          ═══ query() 返回 ═══
+
+总计: 3 次 API 调用，~12 秒，消耗 ~5000 input tokens + ~2000 output tokens
+其中 prompt cache 节省了第 2、3 次调用的 ~80% input token 费用
+```
+
+**关键观察**：
+- 第一次迭代的 Read 和 Grep **在 Claude 还在输出时就开始执行了**（StreamingToolExecutor 的价值）
+- 第二次 API 调用的前缀与第一次完全相同 → **prompt cache 命中**（只付增量 token 的钱）
+- Edit 工具**独占执行**（不与其他工具并行），因为它修改文件
+- 整个过程是 3 次 `while(true)` 迭代，不是 3 次递归调用
+
 ---
 ## 4.2 StreamingToolExecutor — 流式并发执行引擎
 
@@ -187,7 +326,44 @@ const next: State = {
  总计: 5 + max(2,3,1.5) = 8s 节省 31%
 ```
 
-### 4.2.2 并发控制模型
+### 4.2.2 并发控制模型：为什么不用 Actor 或 DAG？
+
+在深入实现之前，先理解**为什么选择这个方案**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 方案对比：Agent 工具编排的三种范式                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 方案 A: Actor 模型 (Erlang/Elixir 风格)                                │
+│   每个工具一个 Actor，消息传递通信                                       │
+│   优点: 天然隔离，故障不传播                                            │
+│   缺点: JS 是单线程 → Actor 退化为 Promise                             │
+│         progress 消息需要额外的 mailbox 机制                            │
+│         sibling abort 需要 supervisor 树 → 过度设计                    │
+│   结论: 在 JS 中 Actor 模型没有真正的并发优势，反而增加复杂度            │
+│                                                                         │
+│ 方案 B: DAG 调度 (LangGraph 风格)                                      │
+│   预先定义工具之间的依赖关系，拓扑排序执行                               │
+│   优点: 依赖关系显式，可以做最优调度                                    │
+│   缺点: Claude 在运行时决定调用哪些工具 → 无法预先建 DAG               │
+│         工具之间的依赖是隐式的（Bash A 的输出可能影响 Bash B）          │
+│         需要等 Claude 完整响应才能建图 → 失去流式执行的优势             │
+│   结论: DAG 适合预定义工作流，不适合 LLM 动态决策的场景                 │
+│                                                                         │
+│ 方案 C: 读写锁 + 流式添加 (Claude Code 的选择) ✓                       │
+│   ConcurrencySafe = 读锁，非安全 = 写锁                                │
+│   优点: 简单直觉（读可并行，写必独占）                                  │
+│         支持流式添加（不需要等完整响应）                                 │
+│         sibling abort 自然融入（共享 AbortController）                  │
+│   缺点: 不能表达细粒度依赖（如 "Read A 必须在 Edit B 之前"）           │
+│   结论: 在 LLM Agent 场景下，简单 > 精确                               │
+│                                                                         │
+│ 核心洞察: LLM 决定工具调用顺序，而 LLM 通常会按逻辑顺序输出            │
+│ （先 Read 再 Edit），所以简单的读写锁就够了。                           │
+│ 如果 LLM 输出了错误的顺序，Bash 错误的 sibling abort 会兜底。          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 StreamingToolExecutor 使用了一个精巧的并发控制模型：
 
@@ -896,6 +1072,134 @@ if (pendingToolUseSummary) {
 | 9 | Sleep 触发深队列消费 | 让等待中的 Agent 能收到通知 |
 | 10 | API 错误跳过 Hooks | 防止死亡螺旋 |
 | 11 | Config 快照 | 为纯函数 reducer 重构做准备 |
+
+---
+## 4.12 可迁移的设计模式 — 带走这些，用在你自己的 Agent 系统中
+
+以上 11 个巧思是 Claude Code 特有的，但它们背后有**通用的设计模式**，
+可以直接迁移到任何 Agent 系统中：
+
+### 模式1：乐观恢复（Optimistic Recovery）
+
+**在 Claude Code 中**：withhold 模式 — 扣留错误消息，尝试恢复，恢复失败再暴露。
+
+**通用形式**：
+```
+收到错误 → 不立即传播 → 尝试恢复策略 A → 失败 → 尝试策略 B → 失败 → 传播错误
+```
+
+**适用场景**：
+- API 网关的重试机制（502 不立即返回给客户端，先重试其他后端）
+- 数据库连接池（连接断开不立即报错，先尝试重连）
+- 分布式系统的 leader 选举（leader 失联不立即告知客户端，先选新 leader）
+
+**关键约束**：withhold 和 recover 必须使用**同一个 gate 变量**（hoisted gate），
+否则在 withhold 和 recover 之间条件翻转会导致消息丢失。
+
+### 模式2：分层降级（Layered Degradation）
+
+**在 Claude Code 中**：5 层压缩管线 — 便宜的先做，贵的后做。
+
+**通用形式**：
+```
+问题发生 → 尝试零成本方案 → 不够 → 尝试低成本方案 → 不够 → 尝试高成本方案
+```
+
+**适用场景**：
+- CDN 缓存策略（内存缓存 → 磁盘缓存 → 回源）
+- 搜索引擎降级（精确匹配 → 模糊匹配 → 语义搜索）
+- 负载均衡（本地实例 → 同区域 → 跨区域）
+
+**关键约束**：每层的执行顺序必须固定，且前一层的结果要能被后一层感知
+（如 snipCompact 返回 tokensFreed 给 autocompact 参考）。
+
+### 模式3：状态机 + 转换记录（State Machine with Transition Log）
+
+**在 Claude Code 中**：`while(true)` + `transition` 字段 — 记录为什么继续，防止恢复循环。
+
+**通用形式**：
+```
+while (true) {
+  state = process(state)
+  state.transition = { reason, timestamp }
+  if (shouldStop(state)) break
+  if (isRecoveryLoop(state.transition, previousTransition)) break // 防止无限循环
+}
+```
+
+**适用场景**：
+- 工作流引擎（记录每步为什么跳转，防止循环审批）
+- 游戏 AI 状态机（记录状态转换原因，防止行为抖动）
+- 编译器优化 pass（记录每个 pass 的效果，防止优化循环）
+
+**关键约束**：transition 记录不只是调试用的 — 它是**防止无限循环的守卫条件**。
+
+### 模式4：读写锁语义的并发控制
+
+**在 Claude Code 中**：ConcurrencySafe = 读锁，非安全 = 写锁。
+
+**通用形式**：
+```
+操作分为两类：
+- 只读操作（可并行）：多个只读操作可以同时执行
+- 写操作（独占）：写操作执行时，其他所有操作等待
+```
+
+**适用场景**：
+- 数据库的 MVCC（读不阻塞读，写阻塞一切）
+- 文件系统的 flock（LOCK_SH vs LOCK_EX）
+- Kubernetes 的 admission webhook（多个 mutating webhook 串行，validating 并行）
+
+**关键约束**：在 LLM Agent 场景下，工具的读写属性是**静态声明**的（工具定义时确定），
+不是运行时推断的。这比数据库简单得多，但也意味着不能表达细粒度依赖。
+
+### 模式5：不可变配置快照（Immutable Config Snapshot）
+
+**在 Claude Code 中**：`buildQueryConfig()` 在入口处快照一次，整个循环不变。
+
+**通用形式**：
+```
+const config = snapshot(mutableGlobalConfig) // 入口处快照
+for (const event of events) {
+  state = reducer(state, event, config) // config 是不可变的
+}
+```
+
+**适用场景**：
+- React/Redux 的 store 设计（action → reducer → new state）
+- 游戏引擎的帧更新（每帧开始时快照输入状态）
+- 微服务的配置热更新（请求开始时快照配置，请求内不变）
+
+**关键约束**：这是为**可测试性**服务的 — 纯函数 `(state, event, config) → newState`
+比闭包捕获全局变量容易测试得多。
+
+### 模式6：级联取消的层级控制（Hierarchical Cancellation）
+
+**在 Claude Code 中**：三层 AbortController — 用户中断取消一切，Bash 错误只取消兄弟，权限拒绝冒泡到 turn。
+
+**通用形式**：
+```
+Root AbortController (最高级别的取消)
+ └── Group AbortController (组级别的取消)
+     ├── Task A AbortController
+     ├── Task B AbortController
+     └── Task C AbortController
+
+取消传播规则：
+- Root 取消 → 所有 Group 和 Task 取消
+- Group 取消 → 该组的所有 Task 取消，Root 不受影响
+- Task 取消 → 根据原因决定是否冒泡到 Group
+```
+
+**适用场景**：
+- 微服务的请求取消传播（gateway timeout → 取消所有下游调用）
+- CI/CD 的 job 取消（取消 pipeline → 取消所有 stage → 取消所有 step）
+- 浏览器的 fetch 取消（页面导航 → 取消所有进行中的请求）
+
+**关键约束**：取消原因（`abort reason`）必须携带语义信息，
+让子级能根据原因决定是否冒泡。不是所有取消都应该传播到父级。
+
+---
 
 ### 下一章预告
 第5章将深入 **多 Agent 系统**——理解 AgentTool 如何创建和管理子 Agent。

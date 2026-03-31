@@ -5,13 +5,15 @@
 > 本章将深入每一个工程巧思。
 
 ## 学习目标
-1. 理解 Agent 上下文隔离的"默认隔离，显式共享"设计
+1. 理解 Agent 上下文隔离的“默认隔离，显式共享”设计
 2. 理解 Fork 子 Agent 的 prompt cache 共享机制
 3. 理解 runAgent 的 12 步清理流程（为什么每一步都不能少）
 4. 理解权限模式的继承与覆盖规则
 5. 理解异步 Agent 的生命周期管理（spawn → progress → complete/kill）
 6. 理解工具集解析的多层过滤策略
-
+7. **新增** 通过完整的 Coordinator 编排案例建立实战认知
+8. **新增** 理解 Worker 间的通信机制和消息时序
+9. **新增** 提炼可迁移到自己 Agent 系统中的设计模式
 ---
 
 ## 5.1 架构总览
@@ -974,6 +976,152 @@ Coordinator 的 system prompt 中有一个精心设计的决策矩阵：
 
 核心原则：**上下文重叠度高 → Continue，低 → Spawn fresh**。
 
+### 5.14.6 Worker 通信机制详解
+
+Worker 之间不能直接通信，所有通信都通过 Coordinator 中转。理解这三种通信机制的区别至关重要：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 三种 Worker 通信机制对比                                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 1. task-notification (异步消息)                                        │
+│    方向: Worker → Coordinator                                          │
+│    触发: Worker 完成/失败/被 kill                                     │
+│    格式: <task-notification>                                             │
+│          <task_id>worker-123</task_id>                                   │
+│          <status>completed</status>                                      │
+│          <result>修复了 3 个文件...</result>                              │
+│          </task-notification>                                            │
+│    时序: 通过消息队列异步到达，Coordinator 在下次迭代时消费           │
+│    丢失处理: 不会丢失，队列持久化在内存中                             │
+│                                                                         │
+│ 2. SendMessage (主动消息)                                               │
+│    方向: Coordinator → Worker                                          │
+│    触发: Coordinator 主动发送指令或追加上下文                       │
+│    用途: 继续已有 Worker 的工作（而不是 spawn 新的）                   │
+│    时序: 同步注入到 Worker 的消息队列，Worker 在下次迭代时看到        │
+│    限制: 只能发给还活着的 Worker                                     │
+│                                                                         │
+│ 3. Scratchpad 文件 (共享存储)                                        │
+│    方向: Worker ↔ Worker (通过文件系统)                              │
+│    触发: Worker 写文件，另一个 Worker 读文件                          │
+│    用途: 共享研究结果、中间数据、配置文件                            │
+│    时序: 无保证！Worker A 写入后，Worker B 不一定立即看到            │
+│    限制: 无锁机制，需要 Coordinator 协调读写顺序                    │
+│                                                                         │
+│ 实践原则:                                                              │
+│ - 控制流用 task-notification + SendMessage                              │
+│ - 数据流用 Scratchpad                                                   │
+│ - Coordinator 负责协调时序，不依赖 Worker 自己同步                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.14.7 完整编排案例：修复跨 3 个文件的认证 Bug
+
+以下是一个端到端的 Coordinator 编排追踪，展示实际的任务分解、分配、合并过程：
+
+```
+用户输入: "登录后 session 过期但 token 还在缓存中，导致空指针崩溃"
+
+═══ 阶段 1: Research (并行研究) ═══
+
+Coordinator 思考:
+  "这涉及 session 管理、token 缓存、和认证验证三个领域。
+   我需要先理解代码结构，再制定修复方案。"
+
+T+0s     Coordinator 调用 Agent("研究 session 生命周期管理的代码结构")
+         → spawn Worker-A (async)
+
+T+0.1s   Coordinator 调用 Agent("研究 token 缓存机制和过期处理逻辑")
+         → spawn Worker-B (async)
+
+T+0.1s   Coordinator 调用 Agent("研究认证验证中对 user 字段的空值处理")
+         → spawn Worker-C (async)
+
+         三个 Worker 并行执行，Coordinator 等待...
+
+T+15s    <task-notification> Worker-A 完成
+         结果: "Session 定义在 src/auth/session.ts，
+                expire() 方法清除 session 但不清除 tokenCache，
+                Session 类型的 user 字段在过期后变为 undefined"
+
+T+20s    <task-notification> Worker-B 完成
+         结果: "tokenCache 在 src/auth/tokenCache.ts，
+                使用 sessionId 作为 key，
+                没有监听 session 过期事件，
+                过期的 session 的 token 会一直留在缓存中"
+
+T+22s    <task-notification> Worker-C 完成
+         结果: "src/auth/validate.ts:42 行直接访问 user.id，
+                没有 null check，
+                当 session 过期但 token 还在缓存时，
+                validate() 用缓存的 token 找到过期的 session，
+                session.user 是 undefined → 崩溃"
+
+═══ 阶段 2: Synthesis (综合分析) ═══
+
+Coordinator 思考 (这是最关键的阶段):
+  "根据三个 Worker 的研究，我现在理解了完整的 bug 链路：
+   1. session.expire() 清除 session 但不通知 tokenCache
+   2. tokenCache 保留了过期 session 的 token
+   3. validate() 用缓存 token 找到过期 session，访问 user.id 崩溃
+
+   修复方案：
+   - src/auth/session.ts: expire() 时发出事件
+   - src/auth/tokenCache.ts: 监听过期事件，清除对应 token
+   - src/auth/validate.ts: 添加 null check 作为防御性编程"
+
+═══ 阶段 3: Implementation (并行实施) ═══
+
+决策: Worker-C 研究的文件正好是要编辑的 → Continue Worker-C
+       其他两个文件的修复范围窄 → Spawn fresh
+
+T+25s    Coordinator 调用 SendMessage(Worker-C,
+           "在 src/auth/validate.ts:42 添加 null check：
+            if (!session?.user) return { status: 401, error: 'Session expired' }")
+         → Continue Worker-C
+
+T+25.1s  Coordinator 调用 Agent(
+           "在 src/auth/session.ts 的 expire() 方法中，
+            添加 this.emit('expired', this.id)，
+            并在 src/auth/tokenCache.ts 中监听该事件，
+            收到时调用 cache.delete(sessionId)")
+         → spawn Worker-D (async)
+
+T+35s    <task-notification> Worker-C 完成 (添加了 null check)
+T+40s    <task-notification> Worker-D 完成 (添加了事件机制)
+
+═══ 阶段 4: Verification (独立验证) ═══
+
+决策: 验证者应该用全新视角 → Spawn fresh
+
+T+42s    Coordinator 调用 Agent(
+           "验证以下修复是否完整：
+            1. 运行现有测试 npm test
+            2. 检查 session.expire() 是否正确发出事件
+            3. 检查 tokenCache 是否正确监听并清除
+            4. 检查 validate.ts 的 null check 是否覆盖所有路径")
+         → spawn Worker-E (async, 全新视角)
+
+T+60s    <task-notification> Worker-E 完成
+         结果: "所有测试通过，修复完整"
+
+Coordinator 回复用户: "已修复。根本原因是 session 过期时不清除 token 缓存..."
+
+总计: 5 个 Worker，~60 秒，串行执行需要 ~3 分钟
+```
+
+**案例中的关键决策点**：
+
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| 研究阶段用几个 Worker？ | 3 个 | 每个关注一个领域，避免上下文污染 |
+| Worker-C Continue vs Spawn？ | Continue | 它已经读过 validate.ts，上下文重叠度高 |
+| Worker-D 为什么不继续 Worker-A？ | Spawn fresh | 研究范围广但实施范围窄，避免探索噪音 |
+| 验证为什么用新 Worker？ | Spawn fresh | 验证者应该用全新视角，不被实施者的思路影响 |
+| Coordinator 自己做了什么？ | Synthesis | 理解 bug 链路，制定具体修复规格，不是懒惰转发 |
+
 ---
 ## 本章小结：工程巧思清单
 
@@ -992,6 +1140,116 @@ Coordinator 的 system prompt 中有一个精心设计的决策矩阵：
 | 11 | Cache eviction hint | 主动释放子 Agent 的缓存空间 |
 | 12 | Synthesis 阶段 | Coordinator 必须理解再委派，不能懒惰转发 |
 | 13 | Scratchpad 目录 | 跨 Worker 共享知识，无需权限提示 |
+
+---
+## 5.15 可迁移的设计模式 — 带走这些，用在你自己的 Agent 系统中
+
+### 模式1：Capability-based Security（基于能力的安全模型）
+
+**在 Claude Code 中**：`createSubagentContext` — 默认隔离所有状态，调用者必须显式 opt-in 共享。
+
+**通用形式**：
+```
+创建子组件时：
+  默认: 所有能力 = 无 (或 no-op)
+  显式授权: 只给子组件它需要的最小能力集
+```
+
+**适用场景**：
+- 浏览器沙箱（iframe 默认无权限，通过 `allow="camera"` 显式授权）
+- Docker 容器（默认无网络/文件系统访问，通过 `--cap-add` 授权）
+- 微服务的 API Gateway（默认拒绝所有请求，通过白名单放行）
+
+**关键约束**：某些能力必须始终共享（如 `setAppStateForTasks`），
+否则子组件的副作用无法被父级跟踪，导致资源泄漏。
+
+### 模式2：缓存友好的 Fork（Cache-Friendly Forking）
+
+**在 Claude Code 中**：Fork 子 Agent 精确复制父级的所有缓存关键参数，确保 prompt cache 命中。
+
+**通用形式**：
+```
+创建子进程/子任务时：
+  确保子任务的输入前缀与父任务完全相同
+  → 共享缓存，只为增量部分付费
+```
+
+**适用场景**：
+- Linux 的 fork() + CoW（子进程共享父进程的内存页，只在写入时复制）
+- CDN 的分层缓存（边缘节点共享源站缓存前缀）
+- Git 的 packfile（新分支共享基础对象，只存储增量）
+
+**关键约束**：所有影响缓存 key 的参数都必须精确复制，
+包括不明显的参数（如 `contentReplacementState`）。一个字节的差异就会导致缓存未命中。
+
+### 模式3：确定性清理（Deterministic Cleanup）
+
+**在 Claude Code 中**：`finally` 块中的 12 步清理流程，确保所有退出路径都清理资源。
+
+**通用形式**：
+```
+try {
+  resource = acquire()
+  // ... 使用资源 ...
+} finally {
+  // 每个资源都有对应的清理，且清理顺序与获取顺序相反
+  cleanup_N()  // 最后获取的最先清理
+  cleanup_2()
+  cleanup_1()
+}
+```
+
+**适用场景**：
+- 数据库连接池（连接必须归还，否则池耗尽）
+- 文件句柄（必须关闭，否则 fd 泄漏）
+- Kubernetes Pod（必须清理 sidecar，否则 Pod 卡在 Terminating）
+
+**关键约束**：清理必须是**幂等**的（多次执行结果相同），
+因为在异常场景下可能被重复调用。
+
+### 模式4：星型拓扑编排（Star Topology Orchestration）
+
+**在 Claude Code 中**：Coordinator 模式 — 一个编排者 + 多个 Worker，Worker 之间不直接通信。
+
+**通用形式**：
+```
+         Coordinator
+        /    |    \
+Worker-A  Worker-B  Worker-C
+(不直接通信，通过 Coordinator 中转)
+```
+
+**适用场景**：
+- MapReduce（Master 分发任务，Worker 独立执行，Master 合并结果）
+- 微服务的 Saga 模式（Orchestrator 协调多个服务的事务）
+- CI/CD 的 Pipeline（Controller 调度多个 Stage，Stage 之间通过 artifact 共享数据）
+
+**关键约束**：Coordinator 必须做 **Synthesis**（综合分析），不能只做转发。
+如果 Coordinator 只是把用户请求拆分后直接转发给 Worker，
+那它就是一个没有价值的中间层。真正的价值在于：
+- 研究后综合分析，制定具体的实施规格
+- 根据上下文重叠度决定 Continue vs Spawn
+- 验证时用全新视角，避免确认偏差
+
+### 模式5：权限的单调递减（Monotonic Permission Narrowing）
+
+**在 Claude Code 中**：子 Agent 可以收窄权限，但不能放宽父级的权限。
+
+**通用形式**：
+```
+父级权限 = {读, 写, 执行}
+子级权限 ⊆ 父级权限  (只能是子集，不能超集)
+```
+
+**适用场景**：
+- Unix 的 setuid/setgid（子进程不能获得父进程没有的权限）
+- OAuth 的 scope 继承（刷新 token 的 scope 不能超过原始 token）
+- AWS IAM 的 permission boundary（子角色的权限不能超过 boundary）
+
+**关键约束**：更宽松的父级模式（如 `bypassPermissions`）不能被子级收紧，
+因为用户已经明确选择了信任级别。这是一个微妙但重要的设计决策。
+
+---
 
 ### 下一章预告
 第6章将深入 **MCP 协议与扩展系统**——理解 Claude Code 如何通过 MCP 和 Skills 扩展能力。
