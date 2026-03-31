@@ -57,7 +57,14 @@
            ┌───────▼──────┐ ┌────────▼───────┐
            │ 05 多Agent   │ │ 06 MCP扩展     │
            │ (协作架构)   │ │ (开放生态)     │
-           └──────────────┘ └────────────────┘
+           └──────┬───────┘ └───────┬────────┘
+                  │                 │
+                  └────────┬────────┘
+                           │
+                  ┌────────▼────────┐
+                  │ 07 Prompt       │
+                  │ (AI的灵魂)      │
+                  └─────────────────┘
 ```
 
 ### 章节详情
@@ -71,8 +78,9 @@
 | 04 | [04_query_loop_api.ipynb](04_query_loop_api.ipynb) | 🔄 查询循环与 API 交互 | `query.ts`, `StreamingToolExecutor.ts` | 40min |
 | 05 | [05_multi_agent_system.ipynb](05_multi_agent_system.ipynb) | 🤖 多 Agent 系统 | `AgentTool.tsx`, `runAgent.ts` | 40min |
 | 06 | [06_mcp_extensions.ipynb](06_mcp_extensions.ipynb) | 🔌 MCP 协议与扩展 | `mcp/client.ts`, `skills/`, `plugins/` | 30min |
+| 07 | [07_prompt_engineering.ipynb](07_prompt_engineering.ipynb) | 📝 Prompt Engineering 深度解析 | `prompts.ts`, `BashTool/prompt.ts`, `compact/prompt.ts` | 60min |
 
-**总计约 4 小时**，可以系统性地理解 Claude Code 的核心架构。
+**总计约 5 小时**，可以系统性地理解 Claude Code 的核心架构。
 
 ## 🎯 推荐学习路径
 
@@ -94,9 +102,15 @@
 ```
 理解：Agent 架构 → 查询循环 → MCP 扩展
 
-### 📖 完整学习 (4 小时)
+### 📝 Prompt 研究 (1 小时)
 ```
-00 → 01 → 02 → 03 → 04 → 05 → 06
+00 → 07
+```
+理解：系统提示词 → 工具提示词 → Agent 提示词 → 压缩提示词 → 缓存优化
+
+### 📖 完整学习 (5 小时)
+```
+00 → 01 → 02 → 03 → 04 → 05 → 06 → 07
 ```
 
 ## 🗺️ 架构全景图
@@ -203,6 +217,7 @@ Claude API 流式返回 tool_use 块
 | 04 查询 | `StreamingToolExecutor` 流式并发执行，Bash 错误级联取消兄弟工具 |
 | 05 Agent | Explore Agent 省略 CLAUDE.md 节省 token，8 步清理防资源泄露 |
 | 06 MCP | `mcp__server__tool` 命名约定，ToolSearch 延迟加载减少初始 token |
+| 07 Prompt | 7大类40+个prompt文件，静态/动态分离缓存优化，Meta-Prompt生成Agent |
 
 ## 🛠️ 如何使用
 
